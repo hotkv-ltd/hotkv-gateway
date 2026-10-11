@@ -21,7 +21,7 @@ import (
 )
 
 // Version is set at build time.
-var Version = "1.0.0"
+var Version = "1.1.0"
 
 // Header the gateway adds to every cacheable response: HIT, SEMANTIC-HIT, MISS, COALESCED or BYPASS.
 const cacheHeader = "X-Hotkv-Cache"
@@ -33,11 +33,14 @@ const (
 	kindChat
 	kindCompletions
 	kindEmbeddings
+	kindMessages
 )
 
 func kindOf(path string) kind {
 	p := strings.TrimSuffix(path, "/")
 	switch {
+	case strings.HasSuffix(p, "/v1/messages"):
+		return kindMessages // Anthropic's Messages API; /messages/batches and /messages/count_tokens are not matched
 	case strings.HasSuffix(p, "/chat/completions"):
 		return kindChat
 	case strings.HasSuffix(p, "/embeddings"):
@@ -226,8 +229,16 @@ func (g *Gateway) cached(w http.ResponseWriter, r *http.Request) {
 
 	k := kindOf(r.URL.Path)
 	tenant := tenantID(r, g.cfg.Scope, g.cfg.TenantHeaders)
-	key := requestKey(r.URL.Path, r.URL.RawQuery, tenant, req)
+	key := requestKey(r.URL.Path, r.URL.RawQuery, tenant+behaviourSalt(r), req)
 	stream := isStream(req)
+	// The cache key is made from what the caller sent; what goes upstream may carry the provider's
+	// automatic prompt caching on top.
+	upBody := body
+	if g.cfg.AnthropicAutoCache && k == kindMessages {
+		if injected, did := withAutoCache(body, g.cfg.AnthropicCacheTTL); did {
+			upBody = injected
+		}
+	}
 	var sx *semCtx
 	if g.sem != nil && k == kindChat {
 		sx = g.semanticContext(r, req, tenant)
@@ -255,9 +266,9 @@ func (g *Gateway) cached(w http.ResponseWriter, r *http.Request) {
 
 	state := "MISS"
 	if stream {
-		g.relayStream(w, r, body, key, k, pol, sx)
+		g.relayStream(w, r, upBody, key, k, pol, sx)
 	} else {
-		state = g.relayJSON(w, r, body, key, k, pol, sx)
+		state = g.relayJSON(w, r, upBody, key, k, pol, sx)
 	}
 	g.logRequest(r, state, req, start)
 }
@@ -443,8 +454,13 @@ func (g *Gateway) relayJSON(w http.ResponseWriter, r *http.Request, body []byte,
 		g.Metrics.Misses.Add(1)
 	}
 	g.writeResult(w, res, state, shared)
-	if !shared && res.err == nil && res.status == http.StatusOK && pol.store {
-		g.storeJSON(r.Context(), snapshot(r), key, k, res, sx)
+	if !shared && res.err == nil && res.status == http.StatusOK {
+		if u, found := usageOf(k, res.body); found {
+			g.Metrics.addUsage(u)
+		}
+		if pol.store {
+			g.storeJSON(r.Context(), snapshot(r), key, k, res, sx)
+		}
 	}
 	return state
 }
@@ -515,7 +531,8 @@ func (g *Gateway) relayStream(w http.ResponseWriter, r *http.Request, body []byt
 	w.Header().Set(cacheHeader, state)
 	w.WriteHeader(resp.StatusCode)
 
-	store := key != "" && pol.store && resp.StatusCode == http.StatusOK && strings.HasPrefix(resp.Header.Get("Content-Type"), "text/event-stream")
+	capture := key != "" && resp.StatusCode == http.StatusOK && strings.HasPrefix(resp.Header.Get("Content-Type"), "text/event-stream")
+	store := capture && pol.store
 	var captured bytes.Buffer
 	flusher, _ := w.(http.Flusher)
 	chunk := make([]byte, 32<<10)
@@ -530,9 +547,9 @@ func (g *Gateway) relayStream(w http.ResponseWriter, r *http.Request, body []byt
 			if flusher != nil {
 				flusher.Flush()
 			}
-			if store {
+			if capture {
 				if captured.Len()+n > g.cfg.MaxEntryBytes {
-					store = false
+					capture, store = false, false
 					captured.Reset()
 				} else {
 					captured.Write(chunk[:n])
@@ -553,24 +570,27 @@ func (g *Gateway) relayStream(w http.ResponseWriter, r *http.Request, body []byt
 		g.log.Warn("upstream stream failed", "error", readErr)
 		panic(http.ErrAbortHandler)
 	}
-	if !store {
+	if !capture {
 		return
 	}
-	st := parseStream(captured.Bytes())
-	if !st.done || !st.finished() {
+	st := parseStreamFor(k, captured.Bytes())
+	if st.complete {
+		g.Metrics.addUsage(st.usage)
+	}
+	if !store || !st.complete {
 		return
 	}
 	e := &Entry{
 		Status: http.StatusOK, ContentType: resp.Header.Get("Content-Type"), Stream: true, Body: captured.String(),
-		Model: st.model, PromptTokens: st.promptTokens, CompletionTokens: st.completionTokens,
+		Model: st.model, PromptTokens: st.usage.promptTotal(), CompletionTokens: st.usage.output,
 	}
 	// The caller has the whole stream; keep it from waiting for the end of the response while the cache is written.
 	ri := snapshot(r)
 	detached := context.WithoutCancel(r.Context())
 	g.background(func() {
 		g.put(detached, key, e)
-		if sx != nil && st.plainText() {
-			g.semanticStore(detached, ri, sx, st.content.String(), e)
+		if sx != nil && st.plainText {
+			g.semanticStore(detached, ri, sx, st.text, e)
 		}
 	})
 }

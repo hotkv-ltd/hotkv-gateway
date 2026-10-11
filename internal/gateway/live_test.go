@@ -80,7 +80,7 @@ func TestLiveEntriesExpire(t *testing.T) {
 	if err := c.Set(ctx, "short", &Entry{Status: 200, Body: "x"}, time.Second); err != nil {
 		t.Fatal(err)
 	}
-	time.Sleep(2200 * time.Millisecond)
+	time.Sleep(3500 * time.Millisecond) // the server keeps expiry in whole seconds, so a 1 s entry can live up to 2 s
 	if e, _ := c.Get(ctx, "short"); e != nil {
 		t.Fatal("entry outlived its ttl")
 	}
@@ -117,7 +117,8 @@ func TestLiveGatewayEndToEnd(t *testing.T) {
 	if c.SemanticAvailable(context.Background()) == nil {
 		sem = c
 	}
-	srv := newGateway(t, up, c, sem, func(cfg *Config) { cfg.CacheTimeout = 2 * time.Second })
+	// the gateway's prefix is the test's own, so the semantic namespaces it creates are cleaned up with the rest
+	srv := newGateway(t, up, c, sem, func(cfg *Config) { cfg.CacheTimeout = 2 * time.Second; cfg.Prefix = c.prefix })
 	r1, _ := post(t, srv.URL, "/v1/chat/completions", "Bearer k", chatBody)
 	r2, b2 := post(t, srv.URL, "/v1/chat/completions", "Bearer k", chatBody)
 	if r1.Header.Get(cacheHeader) != "MISS" || r2.Header.Get(cacheHeader) != "HIT" || up.chat.Load() != 1 {

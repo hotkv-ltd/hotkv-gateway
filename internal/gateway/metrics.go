@@ -20,6 +20,20 @@ type Metrics struct {
 	UpstreamErrors atomic.Uint64 // upstream unreachable
 	CacheErrors    atomic.Uint64 // cache read or write failed (the request went on regardless)
 	TokensSaved    atomic.Uint64 // prompt and completion tokens the hits did not spend
+
+	// What the provider reported for the requests that did go upstream, split so the provider's own
+	// prompt cache can be seen: input is the part of the prompt neither read from nor written to it.
+	UpstreamInput      atomic.Uint64
+	UpstreamOutput     atomic.Uint64
+	UpstreamCacheRead  atomic.Uint64
+	UpstreamCacheWrite atomic.Uint64
+}
+
+func (m *Metrics) addUsage(u upstreamUsage) {
+	m.UpstreamInput.Add(u.input)
+	m.UpstreamOutput.Add(u.output)
+	m.UpstreamCacheRead.Add(u.cacheRead)
+	m.UpstreamCacheWrite.Add(u.cacheWrite)
 }
 
 func (m *Metrics) write(w io.Writer, mode string) {
@@ -37,4 +51,9 @@ func (m *Metrics) write(w io.Writer, mode string) {
 	counter("hotkv_gateway_upstream_errors_total", "Requests the upstream could not be reached for.", m.UpstreamErrors.Load())
 	counter("hotkv_gateway_cache_errors_total", "Cache reads or writes that failed.", m.CacheErrors.Load())
 	counter("hotkv_gateway_tokens_saved_total", "Prompt and completion tokens that cache hits did not spend.", m.TokensSaved.Load())
+	fmt.Fprintf(w, "# HELP hotkv_gateway_upstream_tokens_total Tokens the provider reported for requests that went upstream.\n# TYPE hotkv_gateway_upstream_tokens_total counter\n")
+	fmt.Fprintf(w, "hotkv_gateway_upstream_tokens_total{type=\"input\"} %d\n", m.UpstreamInput.Load())
+	fmt.Fprintf(w, "hotkv_gateway_upstream_tokens_total{type=\"output\"} %d\n", m.UpstreamOutput.Load())
+	fmt.Fprintf(w, "hotkv_gateway_upstream_tokens_total{type=\"cache_read\"} %d\n", m.UpstreamCacheRead.Load())
+	fmt.Fprintf(w, "hotkv_gateway_upstream_tokens_total{type=\"cache_write\"} %d\n", m.UpstreamCacheWrite.Load())
 }

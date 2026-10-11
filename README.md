@@ -15,8 +15,18 @@ from openai import OpenAI
 client = OpenAI(base_url="http://localhost:8080/v1")   # the only change
 ```
 
-- **Exact cache.** An identical chat, completion or embeddings request is answered from the cache.
-  Streaming requests are captured and replayed as a stream.
+For Claude, start the gateway with `--upstream https://api.anthropic.com` and change the same line of
+the Anthropic SDK:
+
+```python
+import anthropic
+
+client = anthropic.Anthropic(base_url="http://localhost:8080")
+```
+
+- **Exact cache.** An identical chat, completion or embeddings request is answered from the cache,
+  and so is an identical request to Anthropic's Messages API. Streaming requests are captured and
+  replayed as a stream.
 - **Semantic cache (optional).** A differently worded question can be answered by a cached answer to a
   similar one (`--semantic`).
 - **Safe by default.** Each API key has its own cache, errors and filtered answers are never cached,
@@ -24,9 +34,9 @@ client = OpenAI(base_url="http://localhost:8080/v1")   # the only change
 - **Never in the way.** If HotKV is slow or down, requests go straight to the LLM API.
 - **Identical requests share one upstream call** while it is in flight.
 - One static binary (about 6 MB) or a small container. Works with OpenAI, Azure OpenAI, OpenRouter,
-  vLLM, Ollama, LiteLLM and anything else that speaks the OpenAI API.
+  vLLM, Ollama, LiteLLM and anything else that speaks the OpenAI API, and with Anthropic's own API.
 
-Written against HotKV server 0.3.0. Tested with the official OpenAI Python SDK.
+Written against HotKV server 0.3.0. Tested with the official OpenAI and Anthropic Python SDKs.
 
 ## Run it
 
@@ -56,11 +66,12 @@ Every cacheable response carries `X-Hotkv-Cache`: `HIT`, `SEMANTIC-HIT`, `MISS`,
 | Request | Cached |
 | --- | --- |
 | `…/chat/completions`, `…/completions`, `…/embeddings` (POST) | yes |
+| `/v1/messages`, Anthropic's Messages API (POST) | yes, exact cache only |
 | streaming (`"stream": true`) | yes, kept as the event stream and replayed |
 | `n` greater than 1 | no |
 | `temperature` above `--max-temperature` (off by default) | no |
 | a model outside `--models` (all by default) | no |
-| any other path (`/v1/models`, files, images, audio...) | passed through untouched |
+| any other path (`/v1/models`, `/v1/messages/count_tokens`, batches, files, images, audio...) | passed through untouched |
 
 A response is stored only when it is a `200` that completed normally: not an error, not
 `content_filter`, and for a stream only if it ended with `[DONE]`. The key covers the endpoint, the
@@ -70,9 +81,34 @@ query string, the caller's credentials and every body field that can change the 
 upstream authenticates on another header, name it with `--tenant-headers`, or callers that differ only
 in that header would share answers. Requests that differ only in key order or number formatting share an entry.
 
+The `anthropic-version`, `anthropic-beta` and `openai-beta` headers are part of the key too, because a
+beta feature or an API version can change the answer.
+
 Per request, a header controls the cache: `X-Hotkv-Cache-Control: no-cache` skips the lookup and
 refreshes the entry, `no-store` reads but does not write, `bypass` skips both. The standard
 `Cache-Control` header works the same way.
+
+## Provider prompt caching
+
+OpenAI and Anthropic also cache prompt prefixes on their side. That is a different thing from this
+gateway, and the two add up:
+
+- A gateway hit never reaches the provider, so it costs nothing at all.
+- A request the gateway has to send upstream still gets the provider's own discount for a repeated
+  prefix.
+
+OpenAI does this automatically, so there is nothing to set up. Anthropic needs `cache_control` in the
+request. If your app does not set it, start the gateway with `--anthropic-auto-cache`: Messages API
+requests that have no `cache_control` anywhere get Anthropic's automatic prompt caching (a top-level
+`cache_control`; add `--anthropic-cache-ttl 1h` for the one-hour lifetime instead of five minutes).
+Requests that already place their own breakpoints are left alone, and the cache key is made from what
+the caller sent, so switching the option never changes which requests share an entry. Anthropic bills
+cache writes above the normal input price, so this pays off when the same prefix repeats within the
+lifetime. Leave it off for prompts that are only sent once.
+
+`/_hotkv/metrics` shows what the providers' own caches did for the requests that went upstream:
+`hotkv_gateway_upstream_tokens_total` with `type` set to `input`, `output`, `cache_read` or
+`cache_write`.
 
 ## Semantic cache
 
@@ -85,6 +121,9 @@ The gateway embeds the last user message with the upstream's embeddings endpoint
 key; the embedding itself is cached) and asks HotKV for the nearest cached prompt. It needs a HotKV
 license that includes the semantic cache, and the gateway refuses to start with `--semantic` without
 one.
+
+The semantic cache works for OpenAI-compatible chat requests. Anthropic has no embeddings API, so
+the Messages API uses the exact cache only.
 
 A match by meaning is only safe when everything else that shapes the answer is the same, so:
 
@@ -126,6 +165,8 @@ keys and says so at startup. The semantic cache always needs a license.
 | `--stream-idle-timeout` | | `5m`: a stream that sends nothing for this long is cut |
 | `--tenant-headers a,b` | | none: extra headers that identify the caller (see above) |
 | `--max-in-flight N` | | `1024`: requests handled at once; more get a 503 with `Retry-After` |
+| `--anthropic-auto-cache` | | off: turn on Anthropic prompt caching for requests that do not use it |
+| `--anthropic-cache-ttl 5m\|1h` | | `5m` (with `--anthropic-auto-cache`) |
 | `--embedding-timeout` | | `5s` |
 | `--semantic`, `--embedding-model`, `--semantic-threshold` | | off, `text-embedding-3-small`, `0.92` |
 | `--prefix` | | `gw`: key and namespace prefix on the HotKV server |
@@ -187,5 +228,6 @@ Valkey, Dragonfly or KeyDB, and this software is built for and tested against Ho
 affiliated with, endorsed by or sponsored by Redis Ltd., the Valkey project, DragonflyDB or KeyDB.
 Redis is a registered trademark of Redis Ltd. Valkey, Dragonfly, KeyDB and all other product and
 company names are trademarks of their respective owners; they are used here only to describe
-protocol and command compatibility. OpenAI is a trademark of OpenAI; this gateway is an independent
-project that speaks the publicly documented API and is not affiliated with or endorsed by OpenAI.
+protocol and command compatibility. OpenAI is a trademark of OpenAI, and Anthropic and Claude are
+trademarks of Anthropic, PBC; this gateway is an independent project that speaks the publicly
+documented APIs and is not affiliated with or endorsed by either company.

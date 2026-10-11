@@ -9,27 +9,76 @@ import (
 	"strings"
 )
 
+// upstreamUsage is what the provider reported for one answer, in additive categories:
+// the input tokens split into those read from the provider's own prompt cache, those written
+// to it, and the rest, plus the output tokens. input+cacheRead+cacheWrite is the whole prompt.
+type upstreamUsage struct {
+	input, output, cacheRead, cacheWrite uint64
+}
+
+func (u upstreamUsage) promptTotal() uint64 { return u.input + u.cacheRead + u.cacheWrite }
+
+func (u upstreamUsage) isZero() bool { return u == upstreamUsage{} }
+
 // jsonInfo is what the gateway needs to know about an upstream answer.
 type jsonInfo struct {
 	model            string
-	promptTokens     uint64
+	promptTokens     uint64 // the whole prompt, which a cache hit saves
 	completionTokens uint64
+	usage            upstreamUsage
 	plainText        bool   // one plain-text answer (no tool calls), which the semantic cache may keep
 	text             string // that answer
 }
 
-type usageJSON struct {
+// openAIUsage covers both shapes OpenAI-compatible APIs use for usage.
+type openAIUsage struct {
 	PromptTokens     uint64 `json:"prompt_tokens"`
 	CompletionTokens uint64 `json:"completion_tokens"`
+	InputTokens      uint64 `json:"input_tokens"`
+	OutputTokens     uint64 `json:"output_tokens"`
+	PromptDetails    struct {
+		Cached     uint64 `json:"cached_tokens"`
+		CacheWrite uint64 `json:"cache_write_tokens"`
+	} `json:"prompt_tokens_details"`
+	InputDetails struct {
+		Cached     uint64 `json:"cached_tokens"`
+		CacheWrite uint64 `json:"cache_write_tokens"`
+	} `json:"input_tokens_details"`
+}
+
+func (u openAIUsage) normalise() upstreamUsage {
+	in, out := u.PromptTokens, u.CompletionTokens
+	if in == 0 {
+		in = u.InputTokens
+	}
+	if out == 0 {
+		out = u.OutputTokens
+	}
+	cached, write := u.PromptDetails.Cached, u.PromptDetails.CacheWrite
+	if cached == 0 && write == 0 {
+		cached, write = u.InputDetails.Cached, u.InputDetails.CacheWrite
+	}
+	rest := uint64(0)
+	if in > cached+write {
+		rest = in - cached - write
+	}
+	return upstreamUsage{input: rest, output: out, cacheRead: cached, cacheWrite: write}
+}
+
+func infoFromUsage(model string, u upstreamUsage) jsonInfo {
+	return jsonInfo{model: model, promptTokens: u.promptTotal(), completionTokens: u.output, usage: u}
 }
 
 // inspectJSON decides whether a non-streaming answer is worth keeping.
-// Errors, truncated-by-filter answers and anything unexpected are not.
+// Errors, answers cut by a filter and anything unexpected are not.
 func inspectJSON(k kind, body []byte) (jsonInfo, bool) {
+	if k == kindMessages {
+		return inspectMessages(body)
+	}
 	var v struct {
 		Model   string          `json:"model"`
 		Error   json.RawMessage `json:"error"`
-		Usage   usageJSON       `json:"usage"`
+		Usage   openAIUsage     `json:"usage"`
 		Data    []json.RawMessage
 		Choices []struct {
 			FinishReason *string `json:"finish_reason"`
@@ -47,7 +96,7 @@ func inspectJSON(k kind, body []byte) (jsonInfo, bool) {
 	if len(v.Error) > 0 && string(v.Error) != "null" {
 		return jsonInfo{}, false
 	}
-	info := jsonInfo{model: v.Model, promptTokens: v.Usage.PromptTokens, completionTokens: v.Usage.CompletionTokens}
+	info := infoFromUsage(v.Model, v.Usage.normalise())
 	if k == kindEmbeddings {
 		return info, len(v.Data) > 0
 	}
@@ -69,12 +118,32 @@ func inspectJSON(k kind, body []byte) (jsonInfo, bool) {
 	return info, true
 }
 
+// usageOf reads the usage of an answer, whether or not the answer may be cached.
+func usageOf(k kind, body []byte) (upstreamUsage, bool) {
+	if k == kindMessages {
+		var v struct {
+			Usage anthropicUsage `json:"usage"`
+		}
+		if json.Unmarshal(body, &v) != nil {
+			return upstreamUsage{}, false
+		}
+		return v.Usage.normalise(), true
+	}
+	var v struct {
+		Usage openAIUsage `json:"usage"`
+	}
+	if json.Unmarshal(body, &v) != nil {
+		return upstreamUsage{}, false
+	}
+	return v.Usage.normalise(), true
+}
+
 func empty(raw json.RawMessage) bool {
 	s := strings.TrimSpace(string(raw))
 	return s == "" || s == "null" || s == "[]"
 }
 
-// streamInfo is what a captured server-sent event stream contains.
+// streamInfo is what a captured server-sent event stream of an OpenAI-style API contains.
 type streamInfo struct {
 	done             bool // saw data: [DONE]
 	bad              bool // a line that is not a normal chunk, such as an error
@@ -83,6 +152,7 @@ type streamInfo struct {
 	hasFinish        bool
 	toolCalls        bool
 	content          strings.Builder
+	usage            upstreamUsage
 	promptTokens     uint64
 	completionTokens uint64
 }
@@ -108,7 +178,7 @@ func parseStream(body []byte) *streamInfo {
 		var chunk struct {
 			Model   string          `json:"model"`
 			Error   json.RawMessage `json:"error"`
-			Usage   *usageJSON      `json:"usage"`
+			Usage   *openAIUsage    `json:"usage"`
 			Choices []struct {
 				FinishReason *string `json:"finish_reason"`
 				Delta        struct {
@@ -126,7 +196,8 @@ func parseStream(body []byte) *streamInfo {
 			s.model = chunk.Model
 		}
 		if chunk.Usage != nil {
-			s.promptTokens, s.completionTokens = chunk.Usage.PromptTokens, chunk.Usage.CompletionTokens
+			s.usage = chunk.Usage.normalise()
+			s.promptTokens, s.completionTokens = s.usage.promptTotal(), s.usage.output
 		}
 		for _, c := range chunk.Choices {
 			if c.Delta.Content != nil {
@@ -141,4 +212,25 @@ func parseStream(body []byte) *streamInfo {
 		}
 	}
 	return s
+}
+
+// streamResult is the part of a captured stream the relay needs, whichever API produced it.
+type streamResult struct {
+	complete  bool // the stream ended normally and may be kept
+	model     string
+	usage     upstreamUsage
+	plainText bool
+	text      string
+}
+
+func parseStreamFor(k kind, body []byte) streamResult {
+	if k == kindMessages {
+		s := parseAnthropicStream(body)
+		return streamResult{complete: s.complete(), model: s.model, usage: s.usage}
+	}
+	s := parseStream(body)
+	return streamResult{
+		complete: s.done && s.finished(), model: s.model, usage: s.usage,
+		plainText: s.plainText(), text: s.content.String(),
+	}
 }

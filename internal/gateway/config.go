@@ -48,6 +48,10 @@ type Config struct {
 	EmbeddingTimeout  time.Duration // longest the semantic cache waits for an embedding
 	MaxInFlight       int           // most requests held in memory at once; more get a 503
 
+	// AnthropicAutoCache turns on Anthropic's prompt caching for Messages API requests that do not use it.
+	AnthropicAutoCache bool
+	AnthropicCacheTTL  string // "5m" or "1h": how long the provider keeps what it cached
+
 	Semantic          bool    // also answer by meaning
 	EmbeddingModel    string  // model used to embed the prompt for the semantic cache
 	SemanticThreshold float64 // similarity needed for a semantic hit
@@ -70,6 +74,7 @@ func DefaultConfig() Config {
 		StreamIdleTimeout: 5 * time.Minute,
 		EmbeddingTimeout:  5 * time.Second,
 		MaxInFlight:       1024,
+		AnthropicCacheTTL: "5m",
 		EmbeddingModel:    "text-embedding-3-small",
 		SemanticThreshold: 0.92,
 		MaxSemanticSpaces: 1000,
@@ -95,6 +100,9 @@ func (c *Config) Validate() error {
 	}
 	if c.CacheTimeout <= 0 || c.UpstreamTimeout <= 0 || c.StreamIdleTimeout <= 0 || c.EmbeddingTimeout <= 0 {
 		return errors.New("timeouts must be positive")
+	}
+	if c.AnthropicCacheTTL != "5m" && c.AnthropicCacheTTL != "1h" {
+		return errors.New("anthropic cache ttl must be 5m or 1h")
 	}
 	if c.MaxInFlight < 1 {
 		return errors.New("max in-flight requests must be at least 1")

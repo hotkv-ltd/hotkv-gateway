@@ -37,6 +37,20 @@ var defaultTenantHeaders = []string{
 	"X-Goog-Api-Key", "Cookie",
 }
 
+// behaviourHeaders change what an API does with a request (a beta feature, an API version), so they are
+// part of every cache key: an answer produced under one setting is never served under another.
+var behaviourHeaders = []string{"Anthropic-Version", "Anthropic-Beta", "Openai-Beta"}
+
+func behaviourSalt(r *http.Request) string {
+	var b strings.Builder
+	for _, name := range behaviourHeaders {
+		for _, v := range r.Header.Values(name) {
+			fmt.Fprintf(&b, "|%s=%s", strings.ToLower(name), v)
+		}
+	}
+	return b.String()
+}
+
 func tenantHeaderNames(extra []string) []string {
 	return append(append([]string(nil), defaultTenantHeaders...), extra...)
 }
