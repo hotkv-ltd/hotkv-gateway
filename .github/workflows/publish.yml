@@ -1,0 +1,92 @@
+name: Publish
+
+# Pushing a tag such as v1.0.1 tests the code, builds binaries for the common platforms,
+# attaches them to a GitHub release and pushes the container image to ghcr.io.
+# "Run workflow" builds and tests only (dry run).
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.22"
+      - run: go vet ./... && go test -race -count=1 ./...
+
+  binaries:
+    needs: test
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.22"
+      - name: Build every platform
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          [ "${GITHUB_REF_TYPE}" = tag ] || version="0.0.0-dev"
+          mkdir -p dist
+          for target in linux/amd64 linux/arm64 darwin/amd64 darwin/arm64 windows/amd64; do
+            os="${target%/*}"; arch="${target#*/}"
+            ext=""; [ "$os" = windows ] && ext=".exe"
+            CGO_ENABLED=0 GOOS=$os GOARCH=$arch go build -trimpath \
+              -ldflags "-s -w -X github.com/hotkv-ltd/hotkv-gateway/internal/gateway.Version=${version}" \
+              -o "dist/hotkv-gateway-${os}-${arch}${ext}" ./cmd/hotkv-gateway
+          done
+          (cd dist && sha256sum * > SHA256SUMS)
+      - uses: actions/upload-artifact@v7
+        with:
+          name: binaries
+          path: dist/
+          if-no-files-found: error
+
+  release:
+    name: GitHub release
+    needs: binaries
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: binaries
+          path: dist/
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" dist/* --repo "$GITHUB_REPOSITORY" --title "$GITHUB_REF_NAME" --generate-notes
+
+  image:
+    name: Container image
+    needs: test
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v6
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build and push
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          image="ghcr.io/${GITHUB_REPOSITORY}"
+          docker build --build-arg VERSION="${version}" -t "${image}:${version}" -t "${image}:latest" .
+          docker push "${image}:${version}"
+          docker push "${image}:latest"
