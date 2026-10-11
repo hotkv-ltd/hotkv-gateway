@@ -57,7 +57,7 @@ func run(args []string) error {
 	fs.DurationVar(&cfg.StreamIdleTimeout, "stream-idle-timeout", cfg.StreamIdleTimeout, "cut a stream that sends nothing for this long")
 	fs.DurationVar(&cfg.EmbeddingTimeout, "embedding-timeout", cfg.EmbeddingTimeout, "longest the semantic cache waits for an embedding")
 	fs.IntVar(&cfg.MaxInFlight, "max-in-flight", cfg.MaxInFlight, "most requests handled at once; more get a 503")
-	fs.BoolVar(&cfg.AnthropicAutoCache, "anthropic-auto-cache", false, "turn on Anthropic prompt caching (a top-level cache_control) for Messages API requests that do not use it")
+	fs.BoolVar(&cfg.AnthropicAutoCache, "anthropic-auto-cache", false, "turn on Anthropic prompt caching for Messages API requests that do not use it: breakpoints on the tools and the system prompt, and on the conversation once it has an assistant turn")
 	fs.StringVar(&cfg.AnthropicCacheTTL, "anthropic-cache-ttl", cfg.AnthropicCacheTTL, "how long Anthropic keeps what it cached: 5m or 1h (with --anthropic-auto-cache)")
 	logLevel := fs.String("log-level", "info", "debug, info, warn or error")
 	version := fs.Bool("version", false, "print the version and exit")

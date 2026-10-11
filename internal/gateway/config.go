@@ -76,7 +76,7 @@ func DefaultConfig() Config {
 		MaxInFlight:       1024,
 		AnthropicCacheTTL: "5m",
 		EmbeddingModel:    "text-embedding-3-small",
-		SemanticThreshold: 0.92,
+		SemanticThreshold: 0.90,
 		MaxSemanticSpaces: 1000,
 	}
 }

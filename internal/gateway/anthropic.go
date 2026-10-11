@@ -146,22 +146,68 @@ func hasCacheControl(v any) bool {
 	return false
 }
 
-// withAutoCache adds Anthropic's automatic prompt caching to a Messages API request that does not use
-// prompt caching yet: a top-level cache_control, which places the breakpoint on the last cacheable block
-// and moves it forward as a conversation grows. A request that already has any cache_control is left alone.
+// withAutoCache turns on Anthropic's prompt caching for a Messages API request that does not use it yet.
+//
+// What repeats between requests is the tool definitions and the system prompt, so a breakpoint goes on
+// the end of each. That is the part that pays off for a single question with a long fixed prompt. The
+// conversation itself gets Anthropic's automatic breakpoint (a top-level cache_control, which moves to
+// the last block as the conversation grows) only once it has an earlier assistant turn: before that there
+// is no previous breakpoint to read, so the write would cost more and never be used.
+//
+// A request that already has any cache_control, or has nothing to cache, is left alone.
 func withAutoCache(body []byte, ttl string) ([]byte, bool) {
 	req, err := parseBody(body)
 	if err != nil || hasCacheControl(req) {
 		return body, false
 	}
-	cc := map[string]any{"type": "ephemeral"}
-	if ttl == "1h" {
-		cc["ttl"] = "1h"
+	breakpoint := func() map[string]any {
+		cc := map[string]any{"type": "ephemeral"}
+		if ttl == "1h" {
+			cc["ttl"] = "1h"
+		}
+		return cc
 	}
-	req["cache_control"] = cc
+	changed := false
+	if tools, ok := req["tools"].([]any); ok && len(tools) > 0 {
+		if last, ok := tools[len(tools)-1].(map[string]any); ok {
+			last["cache_control"] = breakpoint()
+			changed = true
+		}
+	}
+	switch system := req["system"].(type) {
+	case string:
+		if system != "" {
+			req["system"] = []any{map[string]any{"type": "text", "text": system, "cache_control": breakpoint()}}
+			changed = true
+		}
+	case []any:
+		if len(system) > 0 {
+			if last, ok := system[len(system)-1].(map[string]any); ok {
+				last["cache_control"] = breakpoint()
+				changed = true
+			}
+		}
+	}
+	if hasAssistantTurn(req) {
+		req["cache_control"] = breakpoint()
+		changed = true
+	}
+	if !changed {
+		return body, false
+	}
 	out, err := json.Marshal(req)
 	if err != nil {
 		return body, false
 	}
 	return out, true
+}
+
+func hasAssistantTurn(req map[string]any) bool {
+	msgs, _ := req["messages"].([]any)
+	for _, m := range msgs {
+		if mm, ok := m.(map[string]any); ok && mm["role"] == "assistant" {
+			return true
+		}
+	}
+	return false
 }

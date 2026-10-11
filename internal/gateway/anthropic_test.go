@@ -270,56 +270,92 @@ func TestOpenAIPromptCacheUsageIsReadInBothShapes(t *testing.T) {
 	}
 }
 
-func TestAutoCacheTurnsOnProviderCachingOnlyWhereItIsNotAlreadyUsed(t *testing.T) {
+func upstreamJSON(up *anthUpstream) map[string]any {
+	var m map[string]any
+	json.Unmarshal([]byte(up.lastBody.Load().(string)), &m)
+	return m
+}
+
+func TestAutoCachePutsBreakpointsOnWhatRepeatsBetweenRequests(t *testing.T) {
 	up := newAnthUpstream(t)
 	srv := newGateway(t, up.upstream, newMemCache(), nil, func(c *Config) { c.AnthropicAutoCache = true })
-	upstreamSaw := func() map[string]any {
-		var m map[string]any
-		json.Unmarshal([]byte(up.lastBody.Load().(string)), &m)
-		return m
+
+	// a long fixed system prompt and a short question: the system prompt is what a later request can read
+	withSystem := `{"model":"claude-test","max_tokens":10,"system":"You follow these rules.","messages":[{"role":"user","content":"q1"}]}`
+	anthPost(t, srv, "/v1/messages", "k", withSystem)
+	got := upstreamJSON(up)
+	blocks, _ := got["system"].([]any)
+	last, _ := blocks[len(blocks)-1].(map[string]any)
+	cc, _ := last["cache_control"].(map[string]any)
+	if len(blocks) != 1 || last["text"] != "You follow these rules." || cc["type"] != "ephemeral" {
+		t.Fatalf("the system prompt was sent as %v", got["system"])
 	}
-	anthPost(t, srv, "/v1/messages", "k", msgBody)
-	cc, _ := upstreamSaw()["cache_control"].(map[string]any)
-	if cc["type"] != "ephemeral" || cc["ttl"] != nil {
-		t.Fatalf("the upstream saw cache_control %v", cc)
+	if _, top := got["cache_control"]; top {
+		t.Fatal("a single question got the conversation breakpoint, which could only cost more")
 	}
-	// the cache key is made from what the caller sent, so the same request hits
-	r, _ := anthPost(t, srv, "/v1/messages", "k", msgBody)
-	if r.Header.Get(cacheHeader) != "HIT" {
+	// the cache key is made from what the caller sent, so the same request is a hit
+	if r, _ := anthPost(t, srv, "/v1/messages", "k", withSystem); r.Header.Get(cacheHeader) != "HIT" {
 		t.Fatalf("got %q", r.Header.Get(cacheHeader))
 	}
-	// a request that already places its own breakpoints is left exactly as it is
+
+	// a system prompt given as blocks: the last block is marked, the others are not
+	blocksReq := `{"model":"claude-test","max_tokens":10,"system":[{"type":"text","text":"a"},{"type":"text","text":"b"}],"messages":[{"role":"user","content":"q2"}]}`
+	anthPost(t, srv, "/v1/messages", "k", blocksReq)
+	sys := upstreamJSON(up)["system"].([]any)
+	if _, marked := sys[0].(map[string]any)["cache_control"]; marked || sys[1].(map[string]any)["cache_control"] == nil {
+		t.Fatalf("system blocks: %v", sys)
+	}
+
+	// tool definitions: the last one carries the breakpoint
+	withTools := `{"model":"claude-test","max_tokens":10,"tools":[{"name":"a","input_schema":{}},{"name":"b","input_schema":{}}],"messages":[{"role":"user","content":"q3"}]}`
+	anthPost(t, srv, "/v1/messages", "k", withTools)
+	tools := upstreamJSON(up)["tools"].([]any)
+	if _, marked := tools[0].(map[string]any)["cache_control"]; marked || tools[1].(map[string]any)["cache_control"] == nil {
+		t.Fatalf("tools: %v", tools)
+	}
+
+	// a conversation with an earlier assistant turn also gets Anthropic's automatic breakpoint
+	chat := `{"model":"claude-test","max_tokens":10,"messages":[{"role":"user","content":"hi"},{"role":"assistant","content":"hello"},{"role":"user","content":"q4"}]}`
+	anthPost(t, srv, "/v1/messages", "k", chat)
+	if cc, _ := upstreamJSON(up)["cache_control"].(map[string]any); cc["type"] != "ephemeral" {
+		t.Fatalf("a multi-turn conversation was sent as %v", upstreamJSON(up))
+	}
+
+	// nothing that repeats: left exactly as it is
+	anthPost(t, srv, "/v1/messages", "k", msgBody)
+	if strings.Contains(up.lastBody.Load().(string), "cache_control") {
+		t.Fatal("a single question with no system prompt and no tools was changed")
+	}
+
+	// a request that already places its own breakpoints is left alone, wherever they are
 	own := `{"model":"claude-test","max_tokens":10,"system":[{"type":"text","text":"rules","cache_control":{"type":"ephemeral"}}],"messages":[{"role":"user","content":"own"}]}`
 	anthPost(t, srv, "/v1/messages", "k", own)
-	if _, top := upstreamSaw()["cache_control"]; top {
+	if _, top := upstreamJSON(up)["cache_control"]; top {
 		t.Fatal("a top-level cache_control was added to a request that has its own breakpoints")
 	}
-	// other APIs are not touched
-	post(t, srv.URL, "/v1/chat/completions", "Bearer k", chatBody)
 }
 
 func TestAutoCacheCanAskForTheLongerLifetime(t *testing.T) {
 	up := newAnthUpstream(t)
 	srv := newGateway(t, up.upstream, newMemCache(), nil, func(c *Config) { c.AnthropicAutoCache, c.AnthropicCacheTTL = true, "1h" })
-	anthPost(t, srv, "/v1/messages", "k", msgBody)
-	var m map[string]any
-	json.Unmarshal([]byte(up.lastBody.Load().(string)), &m)
-	if cc, _ := m["cache_control"].(map[string]any); cc["ttl"] != "1h" {
-		t.Fatalf("cache_control %v", m["cache_control"])
+	anthPost(t, srv, "/v1/messages", "k", `{"model":"claude-test","max_tokens":10,"system":"rules","messages":[{"role":"user","content":"q"}]}`)
+	sys := upstreamJSON(up)["system"].([]any)
+	if cc, _ := sys[0].(map[string]any)["cache_control"].(map[string]any); cc["ttl"] != "1h" {
+		t.Fatalf("system: %v", sys)
 	}
 }
 
 func TestAutoCacheIsOffByDefault(t *testing.T) {
 	up := newAnthUpstream(t)
 	srv := newGateway(t, up.upstream, newMemCache(), nil, nil)
-	anthPost(t, srv, "/v1/messages", "k", msgBody)
+	anthPost(t, srv, "/v1/messages", "k", `{"model":"claude-test","max_tokens":10,"system":"rules","messages":[{"role":"user","content":"q"}]}`)
 	if strings.Contains(up.lastBody.Load().(string), "cache_control") {
 		t.Fatal("the request was changed although the option is off")
 	}
 }
 
 func TestWithAutoCacheKeepsTheRestOfTheRequest(t *testing.T) {
-	in := `{"model":"m","seed":9007199254740993,"temperature":0.70,"messages":[{"role":"user","content":"<b>&</b>"}],"tools":[{"name":"t"}]}`
+	in := `{"model":"m","seed":9007199254740993,"temperature":0.70,"system":"<b>&</b>","messages":[{"role":"user","content":"<b>&</b>"}],"tools":[{"name":"t"}]}`
 	out, did := withAutoCache([]byte(in), "5m")
 	if !did {
 		t.Fatal("not applied")
@@ -333,11 +369,16 @@ func TestWithAutoCacheKeepsTheRestOfTheRequest(t *testing.T) {
 	if back["seed"].(json.Number).String() != "9007199254740993" || back["temperature"].(json.Number).String() != "0.70" {
 		t.Fatalf("numbers changed: %v %v", back["seed"], back["temperature"])
 	}
-	msgs := back["messages"].([]any)[0].(map[string]any)
-	if msgs["content"] != "<b>&</b>" || back["cache_control"] == nil {
-		t.Fatalf("%v", back)
+	if back["messages"].([]any)[0].(map[string]any)["content"] != "<b>&</b>" || back["system"].([]any)[0].(map[string]any)["text"] != "<b>&</b>" {
+		t.Fatalf("text changed: %v", back)
 	}
-	for _, unchanged := range []string{`not json`, `{"messages":[],"tools":[{"cache_control":{"type":"ephemeral"}}]}`, `[1,2]`} {
+	for _, unchanged := range []string{
+		`not json`,
+		`{"messages":[],"tools":[{"cache_control":{"type":"ephemeral"}}]}`,
+		`[1,2]`,
+		`{"model":"m","messages":[{"role":"user","content":"just a question"}]}`,
+		`{"model":"m","system":"","tools":[],"messages":[{"role":"user","content":"x"}]}`,
+	} {
 		if got, did := withAutoCache([]byte(unchanged), "5m"); did || string(got) != unchanged {
 			t.Errorf("%s was changed", unchanged)
 		}

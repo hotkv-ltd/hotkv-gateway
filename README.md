@@ -98,9 +98,13 @@ gateway, and the two add up:
   prefix.
 
 OpenAI does this automatically, so there is nothing to set up. Anthropic needs `cache_control` in the
-request. If your app does not set it, start the gateway with `--anthropic-auto-cache`: Messages API
-requests that have no `cache_control` anywhere get Anthropic's automatic prompt caching (a top-level
-`cache_control`; add `--anthropic-cache-ttl 1h` for the one-hour lifetime instead of five minutes).
+request. If your app does not set it, start the gateway with `--anthropic-auto-cache`. Messages API
+requests that have no `cache_control` anywhere then get breakpoints on what repeats between requests:
+the end of the tool definitions and of the system prompt. Once a conversation has an earlier assistant
+turn, it also gets Anthropic's automatic breakpoint, which follows the conversation as it grows. A
+single question with no system prompt and no tools is left alone, because there is nothing to read
+back later. Add `--anthropic-cache-ttl 1h` for the one-hour lifetime instead of five minutes.
+
 Requests that already place their own breakpoints are left alone, and the cache key is made from what
 the caller sent, so switching the option never changes which requests share an entry. Anthropic bills
 cache writes above the normal input price, so this pays off when the same prefix repeats within the
@@ -114,7 +118,7 @@ lifetime. Leave it off for prompts that are only sent once.
 
 ```bash
 hotkv-gateway --upstream https://api.openai.com --semantic \
-  --embedding-model text-embedding-3-small --semantic-threshold 0.92
+  --embedding-model text-embedding-3-small --semantic-threshold 0.90
 ```
 
 The gateway embeds the last user message with the upstream's embeddings endpoint (using the caller's
@@ -132,7 +136,11 @@ A match by meaning is only safe when everything else that shapes the answer is t
   the semantic cache (they still use the exact cache);
 - a hit returns the cached answer text as a new response, with zero token counts in `usage`.
 
-Start with a high threshold and lower it while watching the answers.
+Measured with `text-embedding-3-small`, rephrasings of the same question scored between 0.81 and 0.94, and
+unrelated questions below 0.1. The default of 0.90 catches close rephrasings. Raise it if you see a wrong
+answer served for a different question, lower it to catch looser rephrasings, and watch the answers
+either way. An answer the model had to cut short, or that came back empty, is not kept for semantic
+reuse; reasoning models need a token limit large enough to think and then answer.
 
 If the embeddings endpoint fails or takes longer than `--embedding-timeout` (5 seconds), the semantic
 cache pauses for 30 seconds and requests go on without it, so a broken embeddings endpoint never slows
@@ -168,7 +176,7 @@ keys and says so at startup. The semantic cache always needs a license.
 | `--anthropic-auto-cache` | | off: turn on Anthropic prompt caching for requests that do not use it |
 | `--anthropic-cache-ttl 5m\|1h` | | `5m` (with `--anthropic-auto-cache`) |
 | `--embedding-timeout` | | `5s` |
-| `--semantic`, `--embedding-model`, `--semantic-threshold` | | off, `text-embedding-3-small`, `0.92` |
+| `--semantic`, `--embedding-model`, `--semantic-threshold` | | off, `text-embedding-3-small`, `0.90` |
 | `--prefix` | | `gw`: key and namespace prefix on the HotKV server |
 | `--log-level` | | `info` |
 
@@ -202,6 +210,10 @@ HOTKV_TEST_URL=hotkv://127.0.0.1:6379 go test -race ./...   # also the live test
 
 The live tests use a random prefix and remove what they create. They pass against a licensed server
 (prompt cache and semantic cache) and an unlicensed one (plain keys).
+
+To check the gateway against the real OpenAI and Anthropic APIs with your own keys, run
+`scripts/live_providers.py` (see its header for the setup). It makes a few dozen small calls and two long
+ones for the providers' own prompt caches, and costs a few cents.
 
 ## Contributing
 

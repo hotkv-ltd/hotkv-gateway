@@ -111,7 +111,8 @@ func inspectJSON(k kind, body []byte) (jsonInfo, bool) {
 	if k == kindChat && len(v.Choices) == 1 {
 		m := v.Choices[0].Message
 		var text string
-		if empty(m.ToolCalls) && empty(m.FunctionCall) && json.Unmarshal(m.Content, &text) == nil && text != "" {
+		finished := *v.Choices[0].FinishReason == "stop" // a cut-short answer is not reused for other wordings
+		if finished && empty(m.ToolCalls) && empty(m.FunctionCall) && json.Unmarshal(m.Content, &text) == nil && text != "" {
 			info.plainText, info.text = true, text
 		}
 	}
@@ -161,7 +162,9 @@ func (s *streamInfo) finished() bool {
 	return !s.bad && s.hasFinish && s.finish != "content_filter"
 }
 
-func (s *streamInfo) plainText() bool { return !s.toolCalls && s.content.Len() > 0 }
+func (s *streamInfo) plainText() bool {
+	return !s.toolCalls && s.content.Len() > 0 && s.finish == "stop"
+}
 
 func parseStream(body []byte) *streamInfo {
 	s := &streamInfo{}

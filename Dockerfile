@@ -3,7 +3,7 @@ WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download
 COPY . .
-ARG VERSION=1.1.0
+ARG VERSION=1.1.1
 RUN CGO_ENABLED=0 go build -trimpath -ldflags "-s -w -X github.com/hotkv-ltd/hotkv-gateway/internal/gateway.Version=${VERSION}" -o /out/hotkv-gateway ./cmd/hotkv-gateway
 
 # distroless/static has CA certificates (for HTTPS to the LLM API) and nothing else

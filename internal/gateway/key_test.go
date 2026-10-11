@@ -142,3 +142,20 @@ func TestBodiesWithTrailingDataAreNotParsed(t *testing.T) {
 		t.Fatalf("trailing whitespace is fine: %v", err)
 	}
 }
+
+func TestOnlyFinishedAnswersAreKeptForSemanticReuse(t *testing.T) {
+	body := func(reason string) string {
+		return `{"model":"m","choices":[{"finish_reason":"` + reason + `","message":{"content":"partial or full"}}]}`
+	}
+	if info, ok := inspectJSON(kindChat, []byte(body("stop"))); !ok || !info.plainText {
+		t.Fatalf("a finished answer should be reusable: %+v %v", info, ok)
+	}
+	info, ok := inspectJSON(kindChat, []byte(body("length")))
+	if !ok || info.plainText {
+		t.Fatalf("a cut-short answer is cached exactly but never reused for other wordings: %+v %v", info, ok)
+	}
+	cut := parseStream([]byte("data: {\"choices\":[{\"delta\":{\"content\":\"abc\"},\"finish_reason\":\"length\"}]}\n\ndata: [DONE]\n\n"))
+	if !cut.finished() || cut.plainText() {
+		t.Fatal("a stream cut short by the token limit must not be reused semantically")
+	}
+}

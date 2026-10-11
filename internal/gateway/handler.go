@@ -21,7 +21,7 @@ import (
 )
 
 // Version is set at build time.
-var Version = "1.1.0"
+var Version = "1.1.1"
 
 // Header the gateway adds to every cacheable response: HIT, SEMANTIC-HIT, MISS, COALESCED or BYPASS.
 const cacheHeader = "X-Hotkv-Cache"
